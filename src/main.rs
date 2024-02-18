@@ -1,5 +1,13 @@
 use std::{error::Error, io};
 
+mod build_log;
+use build_log::BuildLogEntry;
+
+use std::sync::mpsc;
+use std::thread;
+
+use std::io::BufRead;
+
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
@@ -15,8 +23,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    let log_receiver = spawn_reader();
+
     // create app and run it
-    let res = App::new().run(&mut terminal);
+    let res = App::new(log_receiver).run(&mut terminal);
 
     // restore terminal
     disable_raw_mode()?;
@@ -34,36 +44,65 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-struct LogEntry {
-    commandline: String,
-    status_code: u8,
-    output: String,
+//TODO spawn ninja as subprocess, then we can read directly from it's stdout
+fn spawn_reader() -> mpsc::Receiver<BuildLogEntry> {
+    let (tx, rx) = mpsc::channel::<BuildLogEntry>();
+    thread::spawn(move || {
+        let filename = std::env::args().skip(1).next().unwrap();
+        let file = std::fs::File::open(filename).unwrap();
+        for line in std::io::BufReader::new(file).lines() {
+            let entry = serde_json::from_str(&line.unwrap()).expect("Could not parse json");
+            tx.send(entry).unwrap();
+        }
+    });
+    rx
 }
 
-impl LogEntry {
-    fn entry_color(&self) -> Color {
-        match self.status_code {
-            0 => Color::Reset,
-            _ => Color::Red,
+fn entry_color(success: &bool) -> Color {
+    match success {
+        true => Color::Reset,
+        false => Color::Red,
+    }
+}
+
+fn log_entry_to_list_item(item: &BuildLogEntry) -> ListItem {
+    match item {
+        BuildLogEntry::BuildEdgeFinished {
+            edge_id: _,
+            success,
+            command,
+            output: _,
+        } => {
+            let style = Style::default().bg(entry_color(success));
+            let text = Text::styled(command, style);
+            ListItem::new(text)
         }
     }
-    fn to_list_item(&self) -> ListItem {
-        let style = Style::default().bg(self.entry_color());
-        let text = Text::styled(self.commandline.clone(), style);
-        ListItem::new(text)
+}
+
+fn log_entry_to_output(item: &BuildLogEntry) -> String {
+    match item {
+        BuildLogEntry::BuildEdgeFinished {
+            edge_id: _,
+            success: _,
+            command: _,
+            output,
+        } => output.clone(),
     }
 }
 
 struct App {
-    log_entries: Vec<LogEntry>,
+    log_entries: Vec<BuildLogEntry>,
     state: ListState,
+    log_receiver: mpsc::Receiver<BuildLogEntry>,
 }
 
 impl App {
-    fn new() -> App {
+    fn new(log_receiver: mpsc::Receiver<BuildLogEntry>) -> App {
         App {
-            log_entries: demo_log(),
+            log_entries: Vec::new(),
             state: ListState::default().with_selected(Some(0)),
+            log_receiver,
         }
     }
 
@@ -80,8 +119,13 @@ impl App {
 
     fn run(&mut self, terminal: &mut Terminal<impl Backend>) -> io::Result<()> {
         loop {
+            for entry in self.log_receiver.try_iter() {
+                self.log_entries.push(entry);
+            }
+
             self.draw(terminal)?;
 
+            // TODO event::read blocks until the next event, so no new entries are received until a key is pressed
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     use KeyCode::*;
@@ -118,7 +162,7 @@ impl App {
         let [log_list_area, log_output_area] =
             Layout::vertical([Percentage(50), Percentage(50)]).areas(log_area);
 
-        let list = List::new(self.log_entries.iter().map(LogEntry::to_list_item))
+        let list = List::new(self.log_entries.iter().map(log_entry_to_list_item))
             .block(Block::default().title("Log entries").borders(Borders::ALL))
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
             .highlight_symbol(">> ")
@@ -126,11 +170,11 @@ impl App {
 
         frame.render_stateful_widget(list, log_list_area, &mut self.state);
 
-        let selected_output = self
+        let selected_output: String = self
             .state
             .selected()
             .and_then(|i| self.log_entries.get(i))
-            .map(|e| e.output.clone())
+            .map(log_entry_to_output)
             .unwrap_or(String::new());
         let output_par =
             Paragraph::new(selected_output).block(Block::bordered().title("Log Output"));
@@ -138,24 +182,4 @@ impl App {
 
         frame.render_widget(Block::bordered().title("Dependencies"), dependency_area);
     }
-}
-
-fn demo_log() -> Vec<LogEntry> {
-    vec![
-        LogEntry {
-            commandline: "g++ main.cpp".to_owned(),
-            status_code: 0,
-            output: "".to_owned(),
-        },
-        LogEntry {
-            commandline: "g++ test.cpp".to_owned(),
-            status_code: 0,
-            output: "".to_owned(),
-        },
-        LogEntry {
-            commandline: "g++ something.cpp".to_owned(),
-            status_code: 1,
-            output: "ERROR at line 123".to_owned(),
-        },
-    ]
 }
