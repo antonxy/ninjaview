@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use std::{error::Error, io};
 
 use std::process;
@@ -31,7 +32,6 @@ struct Args {
 
     #[arg(short, long)]
     build_dir: Option<PathBuf>,
-}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
@@ -133,6 +133,11 @@ fn log_entry_to_output(item: &BuildLogEntry) -> String {
     }
 }
 
+enum UIEvent {
+    BuildLog(BuildLogEntry),
+    UserAction(crossterm::event::Event),
+}
+
 struct App {
     log_entries: Vec<BuildLogEntry>,
     state: ListState,
@@ -159,26 +164,41 @@ impl App {
         }
     }
 
+    fn read_event(&mut self) -> io::Result<UIEvent> {
+        loop {
+            match self.log_receiver.try_recv() {
+                Ok(event) => return Ok(UIEvent::BuildLog(event)),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            };
+            if event::poll(Duration::from_millis(100))? {
+                return Ok(UIEvent::UserAction(event::read()?));
+            };
+        }
+    }
+
     fn run(&mut self, terminal: &mut Terminal<impl Backend>) -> io::Result<()> {
         loop {
-            for entry in self.log_receiver.try_iter() {
-                self.log_entries.push(entry);
+            match self.read_event() {
+                Ok(UIEvent::BuildLog(entry)) => {
+                    self.log_entries.push(entry);
+                }
+                Ok(UIEvent::UserAction(Event::Key(key))) => {
+                    if key.kind == KeyEventKind::Press {
+                        use KeyCode::*;
+                        match key.code {
+                            Char('q') | Esc => return Ok(()),
+                            Char('j') | Down => self.select_log(1),
+                            Char('k') | Up => self.select_log(-1),
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(UIEvent::UserAction(_)) => {}
+                Err(e) => return Err(e),
             }
 
             self.draw(terminal)?;
-
-            // TODO event::read blocks until the next event, so no new entries are received until a key is pressed
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    use KeyCode::*;
-                    match key.code {
-                        Char('q') | Esc => return Ok(()),
-                        Char('j') | Down => self.select_log(1),
-                        Char('k') | Up => self.select_log(-1),
-                        _ => {}
-                    }
-                }
-            }
         }
     }
 
