@@ -5,7 +5,7 @@ use std::{error::Error, io};
 use std::process;
 
 mod build_log;
-use build_log::BuildLogEntry;
+use build_log::{BuildLogEntry, BuildState, StructLogMessage};
 
 use std::sync::mpsc;
 use std::thread;
@@ -77,12 +77,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn spawn_file_reader(filename: &Path) -> mpsc::Receiver<BuildLogEntry> {
+fn spawn_file_reader(filename: &Path) -> mpsc::Receiver<StructLogMessage> {
     let file = std::fs::File::open(filename).unwrap();
     spawn_reader(file)
 }
 
-fn spawn_ninja(args: NinjaArgs) -> mpsc::Receiver<BuildLogEntry> {
+fn spawn_ninja(args: NinjaArgs) -> mpsc::Receiver<StructLogMessage> {
     let mut ninja = process::Command::new(args.ninja_binary.unwrap_or("ninja".into()))
         .current_dir(args.build_dir.unwrap_or(PathBuf::from(".")))
         .arg("-d")
@@ -97,8 +97,8 @@ fn spawn_ninja(args: NinjaArgs) -> mpsc::Receiver<BuildLogEntry> {
     spawn_reader(output)
 }
 
-fn spawn_reader<R: Read + Send + 'static>(reader: R) -> mpsc::Receiver<BuildLogEntry> {
-    let (tx, rx) = mpsc::channel::<BuildLogEntry>();
+fn spawn_reader<R: Read + Send + 'static>(reader: R) -> mpsc::Receiver<StructLogMessage> {
+    let (tx, rx) = mpsc::channel::<StructLogMessage>();
     thread::spawn(move || {
         for line in std::io::BufReader::new(reader).lines() {
             let entry = serde_json::from_str(&line.unwrap()).expect("Could not parse json");
@@ -108,67 +108,47 @@ fn spawn_reader<R: Read + Send + 'static>(reader: R) -> mpsc::Receiver<BuildLogE
     rx
 }
 
-fn entry_color(success: &bool) -> Color {
+fn entry_color(success: Option<bool>) -> Color {
     match success {
-        true => Color::Reset,
-        false => Color::Red,
+        Some(true) | None => Color::Reset,
+        Some(false) => Color::Red,
     }
 }
 
 fn log_entry_to_list_item(item: &BuildLogEntry) -> ListItem {
-    match item {
-        BuildLogEntry::BuildEdgeFinished {
-            edge_id: _,
-            success,
-            command,
-            output: _,
-        } => {
-            let style = Style::default().bg(entry_color(success));
-            let text = Text::styled(command, style);
-            ListItem::new(text)
-        }
-    }
-}
-
-fn log_entry_to_output(item: &BuildLogEntry) -> String {
-    match item {
-        BuildLogEntry::BuildEdgeFinished {
-            edge_id: _,
-            success: _,
-            command: _,
-            output,
-        } => output.clone(),
-    }
+    let style = Style::default().bg(entry_color(item.success));
+    let text = Text::styled(item.command.clone(), style);
+    ListItem::new(text)
 }
 
 enum UIEvent {
-    BuildLog(BuildLogEntry),
+    BuildLog(StructLogMessage),
     UserAction(crossterm::event::Event),
 }
 
 struct App {
-    log_entries: Vec<BuildLogEntry>,
-    state: ListState,
-    log_receiver: mpsc::Receiver<BuildLogEntry>,
+    build_state: BuildState,
+    list_state: ListState,
+    log_receiver: mpsc::Receiver<StructLogMessage>,
 }
 
 impl App {
-    fn new(log_receiver: mpsc::Receiver<BuildLogEntry>) -> App {
+    fn new(log_receiver: mpsc::Receiver<StructLogMessage>) -> App {
         App {
-            log_entries: Vec::new(),
-            state: ListState::default().with_selected(Some(0)),
+            build_state: BuildState::new(),
+            list_state: ListState::default().with_selected(Some(0)),
             log_receiver,
         }
     }
 
     fn select_log(&mut self, offset: isize) {
-        if self.log_entries.is_empty() {
-            self.state.select(None);
+        if self.build_state.log_entries.is_empty() {
+            self.list_state.select(None);
         } else {
-            let selected = self.state.selected().unwrap_or(0);
-            let new =
-                usize::saturating_add_signed(selected, offset).min(self.log_entries.len() - 1);
-            self.state.select(Some(new));
+            let selected = self.list_state.selected().unwrap_or(0);
+            let new = usize::saturating_add_signed(selected, offset)
+                .min(self.build_state.log_entries.len() - 1);
+            self.list_state.select(Some(new));
         }
     }
 
@@ -188,8 +168,8 @@ impl App {
     fn run(&mut self, terminal: &mut Terminal<impl Backend>) -> io::Result<()> {
         loop {
             match self.read_event() {
-                Ok(UIEvent::BuildLog(entry)) => {
-                    self.log_entries.push(entry);
+                Ok(UIEvent::BuildLog(msg)) => {
+                    self.build_state.update(msg);
                 }
                 Ok(UIEvent::UserAction(Event::Key(key))) => {
                     if key.kind == KeyEventKind::Press {
@@ -216,14 +196,19 @@ impl App {
     }
 
     fn ui(&mut self, frame: &mut Frame) {
-        let vertical = Layout::vertical([Length(1), Min(0)]);
-        let [title_area, main_area] = vertical.areas(frame.size());
+        let [main_area, status_area] = Layout::vertical([Min(0), Length(1)]).areas(frame.size());
 
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::from("Ninja structured log viewer".dark_gray()).centered()
-            ]),
-            title_area,
+            Paragraph::new(vec![Line::from(
+                format!(
+                    " {} - {} / {}",
+                    self.build_state.build_status.to_string(),
+                    self.build_state.log_entries.len(),
+                    self.build_state.total_edges
+                )
+                .dark_gray(),
+            )]),
+            status_area,
         );
 
         let [log_area, dependency_area] =
@@ -232,19 +217,24 @@ impl App {
         let [log_list_area, log_output_area] =
             Layout::vertical([Percentage(50), Percentage(50)]).areas(log_area);
 
-        let list = List::new(self.log_entries.iter().map(log_entry_to_list_item))
-            .block(Block::default().title("Log entries").borders(Borders::ALL))
-            .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-            .highlight_symbol(">> ")
-            .repeat_highlight_symbol(true);
+        let list = List::new(
+            self.build_state
+                .log_entries
+                .iter()
+                .map(log_entry_to_list_item),
+        )
+        .block(Block::default().title("Log entries").borders(Borders::ALL))
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol(">> ")
+        .repeat_highlight_symbol(true);
 
-        frame.render_stateful_widget(list, log_list_area, &mut self.state);
+        frame.render_stateful_widget(list, log_list_area, &mut self.list_state);
 
         let selected_output: String = self
-            .state
+            .list_state
             .selected()
-            .and_then(|i| self.log_entries.get(i))
-            .map(log_entry_to_output)
+            .and_then(|i| self.build_state.log_entries.get(i))
+            .and_then(|e| e.output.clone())
             .unwrap_or(String::new());
         let output_par =
             Paragraph::new(selected_output).block(Block::bordered().title("Log Output"));
