@@ -1,4 +1,7 @@
-use std::fmt::{self, Display};
+use std::{
+    fmt::{self, Display},
+    path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 
@@ -42,6 +45,40 @@ pub struct BuildEdgeStarted {
     pub edge_id: usize,
     pub command: String,
     pub start_time_millis: i64,
+    pub inputs: Vec<BuildEdgeInput>,
+    pub outputs: Vec<BuildEdgeOutput>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BuildEdgeInput {
+    pub node_id: i64,
+    pub path: PathBuf,
+    pub in_type: InputEdgeType,
+}
+
+#[derive(Debug, Deserialize)]
+pub enum InputEdgeType {
+    #[serde(rename = "explicit")]
+    Explicit,
+    #[serde(rename = "implicit")]
+    Implicit,
+    #[serde(rename = "order_only")]
+    OrderOnly,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BuildEdgeOutput {
+    pub node_id: i64,
+    pub path: PathBuf,
+    pub out_type: OutputEdgeType,
+}
+
+#[derive(Debug, Deserialize)]
+pub enum OutputEdgeType {
+    #[serde(rename = "explicit")]
+    Explicit,
+    #[serde(rename = "implicit")]
+    Implicit,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +95,9 @@ pub struct BuildLogEntry {
     pub edge_id: usize,
     pub success: Option<bool>,
     pub command: String,
+    pub compiler: String,
+    pub inputs: Vec<PathBuf>,
+    pub outputs: Vec<PathBuf>,
     pub output: Option<String>,
     pub start_time_millis: i64,
     pub end_time_millis: Option<i64>,
@@ -86,10 +126,19 @@ impl BuildState {
                     .iter()
                     .find(|e| e.edge_id == started.edge_id)
                     .is_none());
+                let command_short = guess_compiler(&started.command).unwrap_or("???".to_owned());
                 self.log_entries.push(BuildLogEntry {
                     edge_id: started.edge_id,
                     success: None,
                     command: started.command,
+                    compiler: command_short,
+                    inputs: started
+                        .inputs
+                        .iter()
+                        .filter(|e| matches!(e.in_type, InputEdgeType::Explicit))
+                        .map(|o| o.path.to_owned())
+                        .collect(),
+                    outputs: started.outputs.iter().map(|o| o.path.to_owned()).collect(),
                     output: None,
                     start_time_millis: started.start_time_millis,
                     end_time_millis: None,
@@ -110,4 +159,12 @@ impl BuildState {
             StructLogMessage::BuildStatus { status } => self.build_status = status,
         }
     }
+}
+
+fn guess_compiler(command: &str) -> Option<String> {
+    let (exe, _) = command.split_once(' ')?; //TODO handle escaping
+    Path::new(exe)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .map(|s| s.to_owned())
 }

@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{error::Error, io};
@@ -117,7 +118,20 @@ fn entry_color(success: Option<bool>) -> Color {
 
 fn log_entry_to_list_item(item: &BuildLogEntry) -> ListItem {
     let style = Style::default().bg(entry_color(item.success));
-    let text = Text::styled(item.command.clone(), style);
+    let inputs: String = item
+        .inputs
+        .iter()
+        .map(|p| p.file_name().unwrap().to_str().unwrap())
+        .intersperse(", ")
+        .collect();
+    let outputs: String = item
+        .outputs
+        .iter()
+        .map(|p| p.file_name().unwrap().to_str().unwrap())
+        .intersperse(", ")
+        .collect();
+    let string: String = format!("{}: {} -> {}", item.compiler, inputs, outputs);
+    let text = Text::styled(string.to_owned(), style);
     ListItem::new(text)
 }
 
