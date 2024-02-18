@@ -19,29 +19,36 @@ use crossterm::{
 };
 use ratatui::{layout::Constraint::*, prelude::*, widgets::*};
 
-use clap::Parser;
+use clap::{Args, Parser};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
-struct Args {
+struct Cli {
+    #[arg(short, long)]
+    log_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    ninja_args: NinjaArgs,
+}
+
+#[derive(Args, Debug)]
+struct NinjaArgs {
     #[arg(long)]
     ninja_binary: Option<PathBuf>,
 
     #[arg(short, long)]
-    log_file: Option<PathBuf>,
-
-    #[arg(short, long)]
     build_dir: Option<PathBuf>,
 
+    #[arg(trailing_var_arg = true)]
+    ninja_args: Vec<String>,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
+    let args = Cli::parse();
 
     let log_receiver = match args.log_file {
         Some(log_file_path) => spawn_file_reader(&log_file_path),
-        None => spawn_ninja(
-            &args.ninja_binary.unwrap_or("ninja".into()),
-            args.build_dir.as_deref(),
-        ),
+        None => spawn_ninja(args.ninja_args),
     };
 
     // setup terminal
@@ -75,11 +82,12 @@ fn spawn_file_reader(filename: &Path) -> mpsc::Receiver<BuildLogEntry> {
     spawn_reader(file)
 }
 
-fn spawn_ninja(ninja_path: &Path, working_dir: Option<&Path>) -> mpsc::Receiver<BuildLogEntry> {
-    let mut ninja = process::Command::new(ninja_path)
-        .current_dir(working_dir.unwrap_or(&PathBuf::from(".")))
+fn spawn_ninja(args: NinjaArgs) -> mpsc::Receiver<BuildLogEntry> {
+    let mut ninja = process::Command::new(args.ninja_binary.unwrap_or("ninja".into()))
+        .current_dir(args.build_dir.unwrap_or(PathBuf::from(".")))
         .arg("-d")
         .arg("structlog")
+        .args(args.ninja_args)
         .stdin(process::Stdio::null())
         .stdout(process::Stdio::piped())
         .spawn()
