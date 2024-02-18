@@ -1,4 +1,7 @@
+use std::path::{Path, PathBuf};
 use std::{error::Error, io};
+
+use std::process;
 
 mod build_log;
 use build_log::BuildLogEntry;
@@ -6,7 +9,7 @@ use build_log::BuildLogEntry;
 use std::sync::mpsc;
 use std::thread;
 
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
@@ -15,15 +18,38 @@ use crossterm::{
 };
 use ratatui::{layout::Constraint::*, prelude::*, widgets::*};
 
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(long)]
+    ninja_binary: Option<PathBuf>,
+
+    #[arg(short, long)]
+    log_file: Option<PathBuf>,
+
+    #[arg(short, long)]
+    build_dir: Option<PathBuf>,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+
+    let log_receiver = match args.log_file {
+        Some(log_file_path) => spawn_file_reader(&log_file_path),
+        None => spawn_ninja(
+            &args.ninja_binary.unwrap_or("ninja".into()),
+            args.build_dir.as_deref(),
+        ),
+    };
+
     // setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-
-    let log_receiver = spawn_reader();
 
     // create app and run it
     let res = App::new(log_receiver).run(&mut terminal);
@@ -44,13 +70,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-//TODO spawn ninja as subprocess, then we can read directly from it's stdout
-fn spawn_reader() -> mpsc::Receiver<BuildLogEntry> {
+fn spawn_file_reader(filename: &Path) -> mpsc::Receiver<BuildLogEntry> {
+    let file = std::fs::File::open(filename).unwrap();
+    spawn_reader(file)
+}
+
+fn spawn_ninja(ninja_path: &Path, working_dir: Option<&Path>) -> mpsc::Receiver<BuildLogEntry> {
+    let mut ninja = process::Command::new(ninja_path)
+        .current_dir(working_dir.unwrap_or(&PathBuf::from(".")))
+        .arg("-d")
+        .arg("structlog")
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn ninja process");
+
+    let output = ninja.stdout.take().unwrap();
+    spawn_reader(output)
+}
+
+fn spawn_reader<R: Read + Send + 'static>(reader: R) -> mpsc::Receiver<BuildLogEntry> {
     let (tx, rx) = mpsc::channel::<BuildLogEntry>();
     thread::spawn(move || {
-        let filename = std::env::args().skip(1).next().unwrap();
-        let file = std::fs::File::open(filename).unwrap();
-        for line in std::io::BufReader::new(file).lines() {
+        for line in std::io::BufReader::new(reader).lines() {
             let entry = serde_json::from_str(&line.unwrap()).expect("Could not parse json");
             tx.send(entry).unwrap();
         }
